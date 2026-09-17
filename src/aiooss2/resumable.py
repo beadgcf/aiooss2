@@ -12,7 +12,7 @@ from oss2.defaults import multiget_threshold as MULTIGET_THRESHOLD
 from oss2.defaults import multipart_num_threads as MULTIPART_NUM_THREADS
 from oss2.defaults import multipart_threshold as MULTIPART_THRESHOLD
 from oss2.defaults import part_size as PART_SIZE
-from oss2.exceptions import InconsistentError
+from oss2.exceptions import InconsistentError, NoSuchUpload
 from oss2.headers import (
     IF_MATCH,
     IF_UNMODIFIED_SINCE,
@@ -323,7 +323,7 @@ class ResumableUploader(_ResumableUploader):
                 )
             )
 
-    def _verify_record(self, record: Optional[Dict]):
+    async def _verify_record(self, record: Optional[Dict]) -> Optional[Dict]:
         if record and not self.__is_record_sane(record):
             logger.warning("The content of record is invalid, delete the record")
             self._del_record()
@@ -336,7 +336,7 @@ class ResumableUploader(_ResumableUploader):
             self._del_record()
             return None
 
-        if record and not self.__upload_exists(record["upload_id"]):
+        if record and not await self._upload_exists(record["upload_id"]):
             logger.warning(
                 "Multipart upload: %s does not exist, delete the record",
                 record["upload_id"],
@@ -344,6 +344,25 @@ class ResumableUploader(_ResumableUploader):
             self._del_record()
             return None
         return record
+
+    async def _upload_exists(self, upload_id: str) -> bool:
+        valid_headers = _filter_invalid_headers(
+            self.__headers,
+            [OSS_SERVER_SIDE_ENCRYPTION, OSS_SERVER_SIDE_DATA_ENCRYPTION],
+        )
+        try:
+            async for _ in AioPartIterator(
+                self.bucket,
+                self.key,
+                upload_id,
+                "0",
+                max_parts=1,
+                headers=valid_headers,
+            ):
+                break
+        except NoSuchUpload:
+            return False
+        return True
 
     async def init_record(self) -> Dict:
         """Initialization record for the file to upload."""
@@ -421,7 +440,7 @@ class ResumableUploader(_ResumableUploader):
         record: Optional[Dict] = self._get_record()
         logger.debug("Load record return %s", record)
 
-        record: Optional[Dict] = self._verify_record(record)
+        record: Optional[Dict] = await self._verify_record(record)
 
         record: Dict = record or await self.init_record()
 

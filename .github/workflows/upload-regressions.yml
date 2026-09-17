@@ -1,0 +1,25 @@
+name: Upload regression tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  uploads:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        aiohttp: ['3.9.5', '3.10.5', '3.10.6', 'latest']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - run: uv venv --python 3.11 .venv
+      - if: matrix.aiohttp != 'latest'
+        run: uv pip install '.[tests]' 'aiohttp==${{ matrix.aiohttp }}'
+      - if: matrix.aiohttp == 'latest'
+        run: uv pip install '.[tests]'
+      - run: uv run --no-project --python .venv/bin/python python -m pytest tests/unit/test_upload_regressions.py
