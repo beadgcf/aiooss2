@@ -204,10 +204,6 @@ class AsyncPayload(Payload):
 
     _value: StreamAdapter
 
-    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
-        """Reject synchronous decoding without consuming the async stream."""
-        raise TypeError("AsyncPayload cannot be decoded synchronously")
-
     async def write(self, writer: AbstractStreamWriter) -> None:
         chunk = await self._value.read(_CHUNK_SIZE)
         while chunk:

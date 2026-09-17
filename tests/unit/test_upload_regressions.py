@@ -139,13 +139,6 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(response.status, 200)
         self.assertEqual(received, [body, body])
 
-    async def test_decode_does_not_consume_stream(self) -> None:
-        adapter = SliceableAdapter(b"payload")
-        payload = AsyncPayload(adapter)
-        with self.assertRaisesRegex(TypeError, "cannot be decoded"):
-            payload.decode()
-        self.assertEqual(await adapter.read(), b"payload")
-
     async def test_bounded_writes_preserve_body_crc_and_progress(self) -> None:
         body = b"x" * (2 * 1024 * 1024 + 17)
         for stream in (body, io.BytesIO(body)):
