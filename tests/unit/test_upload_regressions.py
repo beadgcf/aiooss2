@@ -1,16 +1,20 @@
 """Offline regression tests for resumable uploads and payload streaming."""
+# Checkpoint restoration is exercised at its internal, network-free test seam.
+# pylint: disable=protected-access
 
 from __future__ import annotations
 
 import io
 import tempfile
 import unittest
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
 from aiohttp import ClientSession, web
+from aiohttp.abc import AbstractStreamWriter
 from aiohttp.payload import PAYLOAD_REGISTRY
 from aiohttp.test_utils import TestServer
 from oss2.exceptions import AccessDenied, NoSuchUpload
@@ -18,12 +22,17 @@ from oss2.models import PartInfo
 from oss2.resumable import ResumableStore
 from oss2.utils import _CHUNK_SIZE, Crc64
 
-from aiooss2.adapter import AsyncPayload, FilelikeObjectAdapter, SliceableAdapter
+from aiooss2.adapter import AsyncPayload
 from aiooss2.resumable import ResumableUploader
+from aiooss2.utils import make_adapter
 
 
 class ResumeTests(unittest.IsolatedAsyncioTestCase):
+    """Check checkpoint restoration against a mocked async bucket."""
+
     def setUp(self) -> None:
+        # unittest cleanup keeps the directory alive for each async test.
+        # pylint: disable-next=consider-using-with
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "data"
@@ -53,11 +62,13 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def seed(self) -> dict[str, Any]:
+        """Persist a real checkpoint before simulating a resumed upload."""
         record = await self.uploader.init_record()
         self.bucket.init_multipart_upload.reset_mock()
         return record
 
     async def test_resume_keeps_upload_and_completed_parts(self) -> None:
+        """Reuse the upload ID and completed parts with filtered headers."""
         await self.seed()
         part = PartInfo(1, "etag", size=4, part_crc=0)
         self.bucket.list_parts.side_effect = lambda *args, **kwargs: SimpleNamespace(
@@ -72,11 +83,13 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("x-oss-server-side-encryption", headers)
 
     async def test_empty_existing_upload_is_valid(self) -> None:
+        """Keep an existing upload even when it has no completed parts."""
         await self.seed()
         await self.uploader._load_record()
         self.bucket.init_multipart_upload.assert_not_awaited()
 
     async def test_missing_upload_restarts(self) -> None:
+        """Start a new upload when OSS reports NoSuchUpload."""
         await self.seed()
         self.bucket.list_parts.side_effect = [
             NoSuchUpload(404, {}, "", {}),
@@ -86,6 +99,7 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         self.bucket.init_multipart_upload.assert_awaited_once()
 
     async def test_access_denied_preserves_record(self) -> None:
+        """Propagate authorization errors without discarding the checkpoint."""
         record = await self.seed()
         self.bucket.list_parts.side_effect = AccessDenied(403, {}, "", {})
         with self.assertRaises(AccessDenied):
@@ -94,10 +108,12 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         self.bucket.init_multipart_upload.assert_not_awaited()
 
     async def test_new_upload(self) -> None:
+        """Initialize an upload when no checkpoint exists."""
         await self.uploader._load_record()
         self.bucket.init_multipart_upload.assert_awaited_once()
 
     async def test_changed_file_restarts(self) -> None:
+        """Discard a checkpoint for a changed file."""
         record = await self.seed()
         record["size"] = 9
         self.uploader._put_record(record)
@@ -105,6 +121,7 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
         self.bucket.init_multipart_upload.assert_awaited_once()
 
     async def test_invalid_record_restarts(self) -> None:
+        """Discard malformed checkpoint data."""
         await self.seed()
         self.uploader._put_record({"op_type": "invalid"})
         await self.uploader._load_record()
@@ -112,7 +129,15 @@ class ResumeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PayloadTests(unittest.IsolatedAsyncioTestCase):
+    """Check upload contents and bounded reads without OSS credentials."""
+
+    @staticmethod
+    def record_progress(progress: list[int], consumed: int, _total: int) -> None:
+        """Record progress for one adapter without closing over loop state."""
+        progress.append(consumed)
+
     async def test_registered_payload_uploads_over_http(self) -> None:
+        """Send both adapter types through the real HTTP transport."""
         body = b"payload" * 20000
         received: list[bytes] = []
 
@@ -125,12 +150,7 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
         async with TestServer(app) as server:
             async with ClientSession() as session:
                 for stream in (body, io.BytesIO(body)):
-                    adapter_type = (
-                        SliceableAdapter
-                        if isinstance(stream, bytes)
-                        else FilelikeObjectAdapter
-                    )
-                    adapter = adapter_type(stream)
+                    adapter = make_adapter(stream, enable_crc=True)
                     payload = PAYLOAD_REGISTRY.get(adapter)
                     self.assertIsInstance(payload, AsyncPayload)
                     async with session.put(
@@ -140,29 +160,24 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received, [body, body])
 
     async def test_bounded_writes_preserve_body_crc_and_progress(self) -> None:
+        """Bound each write while preserving contents, CRC, and progress."""
         body = b"x" * (2 * 1024 * 1024 + 17)
         for stream in (body, io.BytesIO(body)):
             with self.subTest(stream_type=type(stream).__name__):
                 progress: list[int] = []
-                crc = Crc64()
-                adapter_type = (
-                    SliceableAdapter
-                    if isinstance(stream, bytes)
-                    else FilelikeObjectAdapter
-                )
-                adapter = adapter_type(
+                adapter = make_adapter(
                     stream,
-                    crc_callback=crc,
-                    progress_callback=lambda consumed, total: progress.append(consumed),
+                    enable_crc=True,
+                    progress_callback=partial(self.record_progress, progress),
                 )
-                writer = SimpleNamespace(write=AsyncMock())
+                writer = AsyncMock(spec=AbstractStreamWriter)
                 await AsyncPayload(adapter).write(writer)
                 chunks = [call.args[0] for call in writer.write.await_args_list]
                 self.assertEqual(b"".join(chunks), body)
                 self.assertLessEqual(max(map(len, chunks)), _CHUNK_SIZE)
                 expected_crc = Crc64()
                 expected_crc(body)
-                self.assertEqual(crc.crc, expected_crc.crc)
+                self.assertEqual(adapter.crc, expected_crc.crc)
                 self.assertEqual(progress[-1], len(body))
 
 
