@@ -205,7 +205,7 @@ class AsyncPayload(Payload):
     _value: StreamAdapter
 
     async def write(self, writer: AbstractStreamWriter) -> None:
-        chunk = await self._value.read()
+        chunk = await self._value.read(_CHUNK_SIZE)
         while chunk:
             if len(chunk) > TOO_LARGE_BYTES_BODY:
                 logger.warning(
@@ -214,7 +214,7 @@ class AsyncPayload(Payload):
                     "io.BytesIO object instead.",
                 )
             await writer.write(chunk)
-            chunk = await self._value.read()
+            chunk = await self._value.read(_CHUNK_SIZE)
 
 
 PAYLOAD_REGISTRY.register(

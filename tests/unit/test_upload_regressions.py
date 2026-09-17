@@ -1,0 +1,170 @@
+"""Offline regression tests for resumable uploads and payload streaming."""
+
+from __future__ import annotations
+
+import io
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock
+
+from aiohttp import ClientSession, web
+from aiohttp.payload import PAYLOAD_REGISTRY
+from aiohttp.test_utils import TestServer
+from oss2.exceptions import AccessDenied, NoSuchUpload
+from oss2.models import PartInfo
+from oss2.resumable import ResumableStore
+from oss2.utils import _CHUNK_SIZE, Crc64
+
+from aiooss2.adapter import AsyncPayload, FilelikeObjectAdapter, SliceableAdapter
+from aiooss2.resumable import ResumableUploader
+
+
+class ResumeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "data"
+        self.path.write_bytes(b"abcdefgh")
+        self.bucket = SimpleNamespace(
+            bucket_name="offline-test",
+            init_multipart_upload=AsyncMock(
+                return_value=SimpleNamespace(upload_id="new")
+            ),
+            list_parts=AsyncMock(
+                return_value=SimpleNamespace(
+                    parts=[], is_truncated=False, next_marker="0"
+                )
+            ),
+        )
+        self.uploader = ResumableUploader(
+            self.bucket,
+            "key",
+            str(self.path),
+            8,
+            store=ResumableStore(root=self.tmp.name),
+            part_size=4,
+            headers={
+                "x-oss-request-payer": "requester",
+                "x-oss-server-side-encryption": "AES256",
+            },
+        )
+
+    async def seed(self) -> dict[str, Any]:
+        record = await self.uploader.init_record()
+        self.bucket.init_multipart_upload.reset_mock()
+        return record
+
+    async def test_resume_keeps_upload_and_completed_parts(self) -> None:
+        await self.seed()
+        part = PartInfo(1, "etag", size=4, part_crc=0)
+        self.bucket.list_parts.side_effect = lambda *args, **kwargs: SimpleNamespace(
+            parts=[part], is_truncated=False, next_marker="0"
+        )
+        await self.uploader._load_record()
+        self.bucket.init_multipart_upload.assert_not_awaited()
+        self.assertEqual(self.uploader._ResumableUploader__finished_size, 4)
+        self.assertEqual(self.uploader._ResumableUploader__finished_parts, [part])
+        headers = self.bucket.list_parts.call_args.kwargs["headers"]
+        self.assertEqual(headers["x-oss-request-payer"], "requester")
+        self.assertNotIn("x-oss-server-side-encryption", headers)
+
+    async def test_empty_existing_upload_is_valid(self) -> None:
+        await self.seed()
+        await self.uploader._load_record()
+        self.bucket.init_multipart_upload.assert_not_awaited()
+
+    async def test_missing_upload_restarts(self) -> None:
+        await self.seed()
+        self.bucket.list_parts.side_effect = [
+            NoSuchUpload(404, {}, "", {}),
+            SimpleNamespace(parts=[], is_truncated=False, next_marker="0"),
+        ]
+        await self.uploader._load_record()
+        self.bucket.init_multipart_upload.assert_awaited_once()
+
+    async def test_access_denied_preserves_record(self) -> None:
+        record = await self.seed()
+        self.bucket.list_parts.side_effect = AccessDenied(403, {}, "", {})
+        with self.assertRaises(AccessDenied):
+            await self.uploader._load_record()
+        self.assertEqual(self.uploader._get_record(), record)
+        self.bucket.init_multipart_upload.assert_not_awaited()
+
+    async def test_new_upload(self) -> None:
+        await self.uploader._load_record()
+        self.bucket.init_multipart_upload.assert_awaited_once()
+
+    async def test_changed_file_restarts(self) -> None:
+        record = await self.seed()
+        record["size"] = 9
+        self.uploader._put_record(record)
+        await self.uploader._load_record()
+        self.bucket.init_multipart_upload.assert_awaited_once()
+
+    async def test_invalid_record_restarts(self) -> None:
+        await self.seed()
+        self.uploader._put_record({"op_type": "invalid"})
+        await self.uploader._load_record()
+        self.bucket.init_multipart_upload.assert_awaited_once()
+
+
+class PayloadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_registered_payload_uploads_over_http(self) -> None:
+        body = b"payload" * 20000
+        received: list[bytes] = []
+
+        async def receive(request: web.Request) -> web.Response:
+            received.append(await request.read())
+            return web.Response(status=200)
+
+        app = web.Application()
+        app.router.add_put("/object", receive)
+        async with TestServer(app) as server:
+            async with ClientSession() as session:
+                for stream in (body, io.BytesIO(body)):
+                    adapter_type = (
+                        SliceableAdapter
+                        if isinstance(stream, bytes)
+                        else FilelikeObjectAdapter
+                    )
+                    adapter = adapter_type(stream)
+                    payload = PAYLOAD_REGISTRY.get(adapter)
+                    self.assertIsInstance(payload, AsyncPayload)
+                    async with session.put(
+                        server.make_url("/object"), data=adapter
+                    ) as response:
+                        self.assertEqual(response.status, 200)
+        self.assertEqual(received, [body, body])
+
+    async def test_bounded_writes_preserve_body_crc_and_progress(self) -> None:
+        body = b"x" * (2 * 1024 * 1024 + 17)
+        for stream in (body, io.BytesIO(body)):
+            with self.subTest(stream_type=type(stream).__name__):
+                progress: list[int] = []
+                crc = Crc64()
+                adapter_type = (
+                    SliceableAdapter
+                    if isinstance(stream, bytes)
+                    else FilelikeObjectAdapter
+                )
+                adapter = adapter_type(
+                    stream,
+                    crc_callback=crc,
+                    progress_callback=lambda consumed, total: progress.append(consumed),
+                )
+                writer = SimpleNamespace(write=AsyncMock())
+                await AsyncPayload(adapter).write(writer)
+                chunks = [call.args[0] for call in writer.write.await_args_list]
+                self.assertEqual(b"".join(chunks), body)
+                self.assertLessEqual(max(map(len, chunks)), _CHUNK_SIZE)
+                expected_crc = Crc64()
+                expected_crc(body)
+                self.assertEqual(crc.crc, expected_crc.crc)
+                self.assertEqual(progress[-1], len(body))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
